@@ -2,7 +2,7 @@
 
 All notable changes to the `pi-intercom` extension will be documented in this file.
 
-## [Unreleased]
+## [0.1.0] - 2026-03-12
 
 ### Added
 - **`ask` action** — `intercom({ action: "ask", to, message })` now sends a message and blocks until the recipient replies, returning the reply as the tool result. Includes a 10-minute timeout, abort handling, disconnect handling, and shutdown cleanup.
