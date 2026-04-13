@@ -4,6 +4,13 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-04-13
+
+### Changed
+- Busy incoming intercom messages now try a graceful detach handshake with `pi-subagents` before falling back to interrupting the active turn.
+- Reply follow-ups are deferred and re-delivered as follow-up wakeups so final confirmation messages stop causing unnecessary `Operation aborted` interruptions.
+- Unnamed sessions now auto-register a stable `session-<id>` display name so orchestrators and delegated children can target each other reliably without a manual `/name`.
+
 ## [0.1.5] - 2026-04-13
 
 ### Changed

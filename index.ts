@@ -9,6 +9,10 @@ import { InlineMessageComponent } from "./ui/inline-message.js";
 import { loadConfig, type IntercomConfig } from "./config.js";
 import type { SessionInfo, Message, Attachment } from "./types.js";
 
+const INTERCOM_DETACH_REQUEST_EVENT = "pi-intercom:detach-request";
+const INTERCOM_DETACH_RESPONSE_EVENT = "pi-intercom:detach-response";
+const INTERCOM_DETACH_TIMEOUT_MS = 200;
+
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -57,6 +61,18 @@ function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: 
 export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: IntercomClient | null = null;
   const config: IntercomConfig = loadConfig();
+  const pendingInterruptedMessages: Array<{
+    from: SessionInfo;
+    message: Message;
+    replyCommand?: string;
+    bodyText: string;
+  }> = [];
+  const pendingDeferredMessages: Array<{
+    from: SessionInfo;
+    message: Message;
+    replyCommand?: string;
+    bodyText: string;
+  }> = [];
   let replyWaiter: {
     from: string;
     replyTo: string;
@@ -103,6 +119,68 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   function rejectReplyWaiter(error: Error): void {
     replyWaiter?.reject(error);
   }
+  function sendIncomingMessage(entry: {
+    from: SessionInfo;
+    message: Message;
+    replyCommand?: string;
+    bodyText: string;
+  }, delivery: "trigger" | "followUp" | "followUpTrigger"): void {
+    const senderDisplay = entry.from.name || entry.from.id.slice(0, 8);
+    const replyHint = entry.replyCommand ? ` — reply: ${entry.replyCommand}` : "";
+    pi.sendMessage(
+      {
+        customType: "intercom_message",
+        content: `**📨 From ${senderDisplay}** (${entry.from.cwd})${replyHint}\n\n${entry.bodyText}`,
+        display: true,
+        details: entry,
+      },
+      delivery === "trigger"
+        ? { triggerTurn: true }
+        : delivery === "followUpTrigger"
+          ? { triggerTurn: true, deliverAs: "followUp" }
+          : { deliverAs: "followUp" }
+    );
+  }
+  function flushInterruptedMessages(): void {
+    if (pendingInterruptedMessages.length === 0) {
+      return;
+    }
+    const entries = pendingInterruptedMessages.splice(0, pendingInterruptedMessages.length);
+    entries.forEach((entry, index) => {
+      sendIncomingMessage(entry, index === 0 ? "trigger" : "followUp");
+    });
+  }
+  function flushDeferredMessages(): void {
+    if (pendingDeferredMessages.length === 0) {
+      return;
+    }
+    const entries = pendingDeferredMessages.splice(0, pendingDeferredMessages.length);
+    entries.forEach((entry, index) => {
+      sendIncomingMessage(entry, index === 0 ? "followUpTrigger" : "followUp");
+    });
+  }
+  async function requestGracefulDetach(): Promise<boolean> {
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        unsubscribe();
+        resolve(false);
+      }, INTERCOM_DETACH_TIMEOUT_MS);
+      const unsubscribe = pi.events.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload) => {
+        if (!payload || typeof payload !== "object") {
+          return;
+        }
+        const response = payload as { requestId?: unknown; accepted?: unknown };
+        if (response.requestId !== requestId) {
+          return;
+        }
+        clearTimeout(timeout);
+        unsubscribe();
+        resolve(response.accepted === true);
+      });
+      pi.events.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId });
+    });
+  }
   async function resolveSessionTarget(nameOrId: string): Promise<string | null> {
     if (!client) {
       return null;
@@ -137,23 +215,31 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             return;
           }
         }
-        const senderDisplay = from.name || from.id.slice(0, 8);
-        const replyCommand = `intercom({ action: "send", to: ${JSON.stringify(from.id)}, replyTo: ${JSON.stringify(message.id)}, message: "..." })`;
-        const replyHint = config.replyHint ? ` — reply: ${replyCommand}` : "";
         const attachmentText = message.content.attachments?.length
           ? formatAttachments(message.content.attachments)
           : "";
         const bodyText = `${message.content.text}${attachmentText}`;
-
-        pi.sendMessage(
-          {
-            customType: "intercom_message",
-            content: `**📨 From ${senderDisplay}** (${from.cwd})${replyHint}\n\n${bodyText}`,
-            display: true,
-            details: { from, message, replyCommand: config.replyHint ? replyCommand : undefined, bodyText },
-          },
-          { triggerTurn: true, deliverAs: "steer" }
-        );
+        const replyCommand = config.replyHint ? `intercom({ action: "send", to: ${JSON.stringify(from.id)}, replyTo: ${JSON.stringify(message.id)}, message: "..." })` : undefined;
+        const entry = { from, message, replyCommand, bodyText };
+        void (async () => {
+          if (!ctx.isIdle()) {
+            const detached = await requestGracefulDetach();
+            if (detached) {
+              sendIncomingMessage(entry, "trigger");
+              return;
+            }
+            if (!ctx.isIdle()) {
+              if (message.replyTo) {
+                pendingDeferredMessages.push(entry);
+                return;
+              }
+              pendingInterruptedMessages.push(entry);
+              ctx.abort();
+              return;
+            }
+          }
+          sendIncomingMessage(entry, "trigger");
+        })();
       });
       client.on("disconnected", (error: Error) => {
         console.error("Intercom disconnected from broker:", error);
@@ -163,8 +249,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       client.on("error", (error) => {
         console.error("Intercom error:", error);
       });
+      let sessionName = pi.getSessionName()?.trim();
+      if (!sessionName) {
+        sessionName = `session-${ctx.sessionManager.getSessionId().slice(0, 8)}`;
+        pi.setSessionName(sessionName);
+      }
       await client.connect({
-        name: pi.getSessionName(),
+        name: sessionName,
         cwd: ctx.cwd ?? process.cwd(),
         model: ctx.model?.id ?? "unknown",
         pid: process.pid,
@@ -180,10 +271,22 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   
   pi.on("session_shutdown", async () => {
     rejectReplyWaiter(new Error("Session shutting down"));
+    pendingInterruptedMessages.length = 0;
+    pendingDeferredMessages.length = 0;
     if (client) {
       await client.disconnect();
       client = null;
     }
+  });
+  pi.on("turn_end", () => {
+    setTimeout(() => {
+      flushInterruptedMessages();
+    }, 0);
+  });
+  pi.on("agent_end", () => {
+    setTimeout(() => {
+      flushDeferredMessages();
+    }, 0);
   });
   pi.on("model_select", (event) => {
     if (client) {
