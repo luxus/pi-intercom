@@ -9,6 +9,13 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ### Changed
 - Added `pi-package` package metadata and peer dependency declarations for Pi runtime packages used by the extension.
+
+## [0.1.8] - 2026-04-14
+
+### Changed
+- Intercom sessions now reconnect automatically after broker disconnects or sleep/wake interruptions instead of staying offline until reload or restart.
+- Replaced raw runtime `console.error` intercom disconnect logging with silent recovery so transient broker churn no longer splashes stray text into the Pi TUI.
+
 ## [0.1.7] - 2026-04-13
 
 ### Changed
